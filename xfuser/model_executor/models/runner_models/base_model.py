@@ -756,6 +756,24 @@ class xFuserModel(abc.ABC):
 
         return determinism_failures, expected_output
 
+    def _dump_model(self, input_args) -> None:
+        debug_mode = input_args["_arech_debug_mode"]
+        del input_args["_arech_debug_mode"]
+
+        with debug_mode:
+            output, timing = self._run_timed_pipe(input_args)
+        
+        rank = get_world_group().rank
+        output_path = f"{self.config.output_directory}/model_dump_{rank}"
+        with open(output_path+".txt", "w", encoding="utf-8") as file:
+            file.write(debug_mode.debug_string(show_stack_trace=True))
+        with open(output_path+"_stack.txt", "w", encoding="utf-8") as file:
+            for op in debug_mode.operators:
+                file.write(op.render(debug_mode.record_tensor_attributes))
+                file.write("\n")
+                if hasattr(op, "stack_trace") and op.stack_trace:
+                    file.write(op.stack_trace)
+                    file.write("\n\n")
 
     def run(self, input_args: dict) -> Tuple[DiffusionOutput, list]:
         """Run the model and optionally check repeated outputs for determinism.
@@ -784,6 +802,9 @@ class xFuserModel(abc.ABC):
                 "inflated and include the time spent on the check. "
                 "Individual iteration timings will not be affected."
             )
+
+        if "_arech_debug_mode" in input_args:
+            self._dump_model(input_args)
 
         inference_start = torch.cuda.Event(enable_timing=True)
         inference_end = torch.cuda.Event(enable_timing=True)

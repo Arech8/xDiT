@@ -119,8 +119,21 @@ if __name__ == "__main__":
     runner = xFuserModelRunner(args)
     runner.print_args(args)
 
-    input_args = runner.preprocess_args(args)
-    runner.initialize(input_args)
+    DUMP_MODEL=True
+    if DUMP_MODEL:
+        from torch.utils._debug_mode import DebugMode
+        debug_mode = DebugMode(record_nn_module=True,record_stack_trace=True, record_ids=True)
+    else:
+        import contextlib
+        debug_mode = contextlib.nullcontext()
+
+    with debug_mode:
+        input_args = runner.preprocess_args(args)
+        runner.initialize(input_args)
+
+    if DUMP_MODEL:
+        input_args["_arech_debug_mode"] = debug_mode
+    del debug_mode
 
     if xfuser_args.profile:
         out, timing, profile = runner.profile(input_args)
