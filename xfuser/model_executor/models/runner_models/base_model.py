@@ -757,23 +757,494 @@ class xFuserModel(abc.ABC):
         return determinism_failures, expected_output
 
     def _dump_model(self, input_args) -> None:
-        debug_mode = input_args["_arech_debug_mode"]
-        del input_args["_arech_debug_mode"]
+        """Capture executable eager and Dynamo FX graphs for compiled components.
 
-        with debug_mode:
-            output, timing = self._run_timed_pipe(input_args)
-        
-        rank = get_world_group().rank
-        output_path = f"{self.config.output_directory}/model_dump_{rank}"
-        with open(output_path+".txt", "w", encoding="utf-8") as file:
-            file.write(debug_mode.debug_string(show_stack_trace=True))
-        with open(output_path+"_stack.txt", "w", encoding="utf-8") as file:
-            for op in debug_mode.operators:
-                file.write(op.render(debug_mode.record_tensor_attributes))
-                file.write("\n")
-                if hasattr(op, "stack_trace") and op.stack_trace:
-                    file.write(op.stack_trace)
-                    file.write("\n\n")
+        The full component graph is the fidelity artifact. ``nn_module_stack``
+        metadata on its nodes lets downstream tooling propose smaller block
+        subgraphs without pretending that separately compiling those blocks is
+        equivalent to compiling the full production component.
+        """
+        input_args.pop("_model_dump_requested", None)
+
+        import operator
+        import random
+
+        from torch.fx.experimental.proxy_tensor import make_fx
+        from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
+
+        world = get_world_group()
+        rank = world.rank
+        dump_root = Path(self.config.output_directory) / f"model_dump_{rank}"
+        dump_root.mkdir(parents=True, exist_ok=True)
+
+        def rng_state():
+            state = {
+                "python": random.getstate(),
+                "numpy": np.random.get_state(),
+                "torch_cpu": torch.get_rng_state(),
+            }
+            if torch.cuda.is_available():
+                state["torch_cuda"] = torch.cuda.get_rng_state_all()
+            return state
+
+        torch.save(rng_state(), dump_root / "rng_state_before.pt")
+
+        def unwrap_compiled(module):
+            while hasattr(module, "_orig_mod"):
+                module = module._orig_mod
+            return module
+
+        def snapshot_tree(tree):
+            # Tensor.__deepcopy__ rejects non-leaf activations. Detaching first
+            # makes a leaf view without changing its storage geometry; deepcopy
+            # then snapshots values while preserving duplicate/view aliases.
+            detached = tree_map(
+                lambda value: (
+                    value.detach() if isinstance(value, torch.Tensor) else value
+                ),
+                tree,
+            )
+            return copy.deepcopy(detached)
+
+        def delete_attr(root, target):
+            parent_name, _, attr_name = target.rpartition(".")
+            parent = rgetattr(root, parent_name) if parent_name else root
+            delattr(parent, attr_name)
+
+        def process_group_name(value):
+            import torch.distributed as dist
+            from torch.distributed.distributed_c10d import _get_process_group_name
+
+            if isinstance(value, torch.ScriptObject):
+                if (
+                    value._type().qualified_name()
+                    != "__torch__.torch.classes.c10d.ProcessGroup"
+                ):
+                    return None
+                value = dist.ProcessGroup.unbox(value)
+            if isinstance(value, dist.ProcessGroup):
+                return _get_process_group_name(value)
+            return None
+
+        def canonicalize_collectives(graph_module):
+            """Make eager c10d traces replayable and ProcessGroup-free.
+
+            ``make_fx`` records ``dist.all_gather_into_tensor`` as the raw
+            c10d out-variant with an unpickleable torchbind ProcessGroup. The
+            raw graph also does not replay the synchronous Python API's value
+            semantics. Rewrite it to the same functional collective + wait +
+            copy form Dynamo uses.
+            """
+            from torch._inductor._functionalize_collectives import (
+                _functionalize_inplace_collectives,
+            )
+
+            _functionalize_inplace_collectives(graph_module)
+            graph = graph_module.graph
+            all_gather = torch.ops.c10d._allgather_base_.default
+
+            for node in list(graph.nodes):
+                if node.op != "call_function" or node.target != all_gather:
+                    continue
+
+                output, input_tensor, process_group_node = node.args[:3]
+                if (
+                    not isinstance(process_group_node, torch.fx.Node)
+                    or process_group_node.op != "get_attr"
+                ):
+                    raise RuntimeError(
+                        "Expected c10d all-gather ProcessGroup to be a get_attr node"
+                    )
+                process_group = rgetattr(
+                    graph_module, process_group_node.target
+                )
+                group_name = process_group_name(process_group)
+                if group_name is None:
+                    raise RuntimeError(
+                        "Unable to resolve c10d all-gather ProcessGroup"
+                    )
+                import torch.distributed as dist
+
+                python_group = (
+                    dist.ProcessGroup.unbox(process_group)
+                    if isinstance(process_group, torch.ScriptObject)
+                    else process_group
+                )
+                with graph.inserting_before(node):
+                    gathered = graph.call_function(
+                        torch.ops._c10d_functional.all_gather_into_tensor.default,
+                        args=(input_tensor, python_group.size(), group_name),
+                    )
+                    waited = graph.call_function(
+                        torch.ops._c10d_functional.wait_tensor.default,
+                        args=(gathered,),
+                    )
+                    copied = graph.call_function(
+                        torch.ops.aten.copy_.default,
+                        args=(output, waited),
+                    )
+
+                for user in list(node.users):
+                    if (
+                        user.op != "call_function"
+                        or user.target is not operator.getitem
+                    ):
+                        raise RuntimeError(
+                            f"Unexpected c10d all-gather user: {user.format_node()}"
+                        )
+                    output_index = user.args[1]
+                    if output_index == 0:
+                        user.replace_all_uses_with(copied)
+                    elif user.users:
+                        raise RuntimeError(
+                            "The asynchronous c10d Work output is used by the graph"
+                        )
+                    graph.erase_node(user)
+                graph.erase_node(node)
+                if not process_group_node.users:
+                    delete_attr(graph_module, process_group_node.target)
+                    graph.erase_node(process_group_node)
+
+            # The all-reduce functionalizer retains its ProcessGroup get_attr.
+            # Replace ProcessGroup arguments to functional collectives with
+            # their registered names, which are serializable and accepted by
+            # the functional c10d schemas.
+            for node in list(graph.nodes):
+                if node.op != "call_function":
+                    continue
+                namespace = getattr(node.target, "namespace", None)
+                if namespace not in {"_c10d_functional", "c10d_functional"}:
+                    continue
+                args = list(node.args)
+                changed = False
+                for index, arg in enumerate(args):
+                    if not isinstance(arg, torch.fx.Node) or arg.op != "get_attr":
+                        continue
+                    group_name = process_group_name(
+                        rgetattr(graph_module, arg.target)
+                    )
+                    if group_name is not None:
+                        args[index] = group_name
+                        changed = True
+                if changed:
+                    node.args = tuple(args)
+
+            for node in list(graph.find_nodes(op="get_attr")):
+                if node.users:
+                    continue
+                delete_attr(graph_module, node.target)
+                graph.erase_node(node)
+
+            graph.eliminate_dead_code()
+            graph.lint()
+            graph_module.recompile()
+            return graph_module
+
+        def graph_node_metadata(graph_module):
+            return [
+                {
+                    "name": node.name,
+                    "op": node.op,
+                    "target": str(node.target),
+                    "nn_module_stack": repr(node.meta.get("nn_module_stack")),
+                    "stack_trace": node.meta.get("stack_trace"),
+                    "tensor_meta": repr(node.meta.get("tensor_meta")),
+                    "val": repr(node.meta.get("val")),
+                }
+                for node in graph_module.graph.nodes
+            ]
+
+        def tensor_tree_metadata(tree):
+            flat, spec = tree_flatten(tree)
+            storage_ids = {}
+            leaves = []
+            for index, value in enumerate(flat):
+                if not isinstance(value, torch.Tensor):
+                    leaves.append(
+                        {
+                            "index": index,
+                            "kind": "value",
+                            "type": f"{type(value).__module__}.{type(value).__qualname__}",
+                            "repr": repr(value),
+                        }
+                    )
+                    continue
+
+                storage_group = None
+                storage_nbytes = None
+                try:
+                    storage = value.untyped_storage()
+                    storage_key = (str(value.device), storage._cdata)
+                    storage_group = storage_ids.setdefault(
+                        storage_key, len(storage_ids)
+                    )
+                    storage_nbytes = storage.nbytes()
+                except (NotImplementedError, RuntimeError):
+                    pass
+
+                memory_format = None
+                if value.layout == torch.strided:
+                    if value.ndim == 4 and value.is_contiguous(
+                        memory_format=torch.channels_last
+                    ):
+                        memory_format = "channels_last"
+                    elif value.ndim == 5 and value.is_contiguous(
+                        memory_format=torch.channels_last_3d
+                    ):
+                        memory_format = "channels_last_3d"
+                    elif value.is_contiguous():
+                        memory_format = "contiguous"
+
+                leaves.append(
+                    {
+                        "index": index,
+                        "kind": "tensor",
+                        "type": f"{type(value).__module__}.{type(value).__qualname__}",
+                        "dtype": str(value.dtype),
+                        "device": str(value.device),
+                        "layout": str(value.layout),
+                        "shape": [str(dim) for dim in value.shape],
+                        "stride": (
+                            [str(dim) for dim in value.stride()]
+                            if value.layout == torch.strided
+                            else None
+                        ),
+                        "storage_offset": (
+                            value.storage_offset()
+                            if value.layout == torch.strided
+                            else None
+                        ),
+                        "storage_group": storage_group,
+                        "storage_nbytes": storage_nbytes,
+                        "memory_format": memory_format,
+                        "requires_grad": value.requires_grad,
+                        "is_parameter": isinstance(value, torch.nn.Parameter),
+                        "is_conj": value.is_conj(),
+                        "is_neg": value.is_neg(),
+                    }
+                )
+            return {"tree_spec": repr(spec), "leaves": leaves}
+
+        component_names = list(dict.fromkeys(self._get_compiled_pipe_components()))
+        captures = {}
+        hooks = []
+        for component_name in component_names:
+            component = getattr(self.pipe, component_name, None)
+            if not isinstance(component, torch.nn.Module):
+                continue
+
+            record = {
+                "component": component,
+                "args": None,
+                "kwargs": None,
+                "output": None,
+            }
+            captures[component_name] = record
+
+            def capture_inputs(_module, args, kwargs, *, _record=record):
+                if _record["args"] is None:
+                    captured_args, captured_kwargs = snapshot_tree((args, kwargs))
+                    _record["args"] = captured_args
+                    _record["kwargs"] = captured_kwargs
+
+            def capture_output(_module, _args, _kwargs, output, *, _record=record):
+                if _record["output"] is None:
+                    _record["output"] = snapshot_tree(output)
+
+            hooks.append(
+                component.register_forward_pre_hook(capture_inputs, with_kwargs=True)
+            )
+            hooks.append(
+                component.register_forward_hook(capture_output, with_kwargs=True)
+            )
+
+        try:
+            # Run the production pipeline once to obtain real rank-local
+            # component boundaries and the compiled reference output.
+            self._run_timed_pipe(input_args)
+        finally:
+            for hook in hooks:
+                hook.remove()
+
+        manifest = {
+            "format_version": 1,
+            "model": self.config.model,
+            "rank": rank,
+            "world_size": world.world_size,
+            "torch_version": torch.__version__,
+            "torch_git_version": getattr(torch.version, "git_version", None),
+            "torch_cuda_version": getattr(torch.version, "cuda", None),
+            "torch_hip_version": getattr(torch.version, "hip", None),
+            "diffusers_version": diffusers.__version__,
+            "compile_mode": self._get_compile_mode(),
+            "compile_dynamic": self._get_compile_dynamic(),
+            "grad_enabled": torch.is_grad_enabled(),
+            "inference_mode_enabled": torch.is_inference_mode_enabled(),
+            "autocast_enabled": torch.is_autocast_enabled(),
+            "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+            "float32_matmul_precision": torch.get_float32_matmul_precision(),
+            "config": {
+                key: repr(value) for key, value in vars(self.config).items()
+            },
+            "environment": {
+                key: value
+                for key, value in os.environ.items()
+                if key.startswith(
+                    (
+                        "AITER",
+                        "CUDA",
+                        "HIP",
+                        "HSA",
+                        "NCCL",
+                        "RCCL",
+                        "TORCH",
+                        "XDIT",
+                        "XFUSER",
+                    )
+                )
+            },
+            "rng_state_before_file": "rng_state_before.pt",
+            "rng_state_after_file": "rng_state_after.pt",
+            "components": [],
+        }
+
+        for component_index, component_name in enumerate(component_names):
+            record = captures.get(component_name)
+            if record is None or record["args"] is None:
+                manifest["components"].append(
+                    {
+                        "name": component_name,
+                        "captured": False,
+                        "reason": "component was not invoked by the capture run",
+                    }
+                )
+                continue
+
+            safe_name = "".join(
+                character if character.isalnum() or character in "-_" else "_"
+                for character in component_name
+            )
+            component_dir = dump_root / f"{component_index:02d}_{safe_name}"
+            component_dir.mkdir(parents=True, exist_ok=True)
+
+            args = record["args"]
+            kwargs = record["kwargs"]
+            compiled_output = record["output"]
+            torch.save(
+                {
+                    "args": args,
+                    "kwargs": kwargs,
+                    "compiled_output": compiled_output,
+                },
+                component_dir / "boundary.pt",
+            )
+
+            target = unwrap_compiled(record["component"])
+            flat_inputs, input_spec = tree_flatten((args, kwargs))
+
+            def flat_call(
+                *flat_args, _input_spec=input_spec, _target=target
+            ):
+                call_args, call_kwargs = tree_unflatten(
+                    list(flat_args), _input_spec
+                )
+                return _target(*call_args, **call_kwargs)
+
+            world.barrier()
+            with torch.no_grad():
+                fx_graph = make_fx(
+                    flat_call,
+                    tracing_mode="real",
+                    record_module_stack=True,
+                    record_stack_traces=True,
+                )(*flat_inputs)
+                with open(
+                    component_dir / "make_fx_raw.py", "w", encoding="utf-8"
+                ) as file:
+                    file.write(fx_graph.code)
+                with open(
+                    component_dir / "make_fx_raw_graph.txt",
+                    "w",
+                    encoding="utf-8",
+                ) as file:
+                    file.write(str(fx_graph.graph))
+                fx_graph = canonicalize_collectives(fx_graph)
+                eager_output = fx_graph(*flat_inputs)
+            world.barrier()
+
+            torch.save(fx_graph, component_dir / "make_fx_graph.pt")
+            torch.save(eager_output, component_dir / "eager_output.pt")
+            with open(component_dir / "make_fx.py", "w", encoding="utf-8") as file:
+                file.write(fx_graph.code)
+            with open(component_dir / "make_fx_graph.txt", "w", encoding="utf-8") as file:
+                file.write(str(fx_graph.graph))
+            with open(
+                component_dir / "make_fx_nodes.json", "w", encoding="utf-8"
+            ) as file:
+                json.dump(graph_node_metadata(fx_graph), file, indent=2)
+
+            # Compile the original Python component with Dynamo's explain
+            # backend. This records every graph segment and graph break, which
+            # an eager operation trace alone cannot recover.
+            world.barrier()
+            with torch.no_grad():
+                explanation = torch._dynamo.explain(target)(*args, **kwargs)
+            world.barrier()
+
+            dynamo_graph_files = []
+            for graph_index, graph in enumerate(explanation.graphs):
+                graph_stem = f"dynamo_graph_{graph_index:03d}"
+                torch.save(graph, component_dir / f"{graph_stem}.pt")
+                with open(
+                    component_dir / f"{graph_stem}.py", "w", encoding="utf-8"
+                ) as file:
+                    file.write(graph.code)
+                with open(
+                    component_dir / f"{graph_stem}.txt", "w", encoding="utf-8"
+                ) as file:
+                    file.write(str(graph.graph))
+                with open(
+                    component_dir / f"{graph_stem}_nodes.json",
+                    "w",
+                    encoding="utf-8",
+                ) as file:
+                    json.dump(graph_node_metadata(graph), file, indent=2)
+                dynamo_graph_files.append(f"{graph_stem}.pt")
+
+            component_manifest = {
+                "name": component_name,
+                "captured": True,
+                "was_compiled": hasattr(record["component"], "_orig_mod"),
+                "boundary_file": "boundary.pt",
+                "make_fx_graph_file": "make_fx_graph.pt",
+                "eager_output_file": "eager_output.pt",
+                "inputs": tensor_tree_metadata((args, kwargs)),
+                "compiled_output": tensor_tree_metadata(compiled_output),
+                "eager_output": tensor_tree_metadata(eager_output),
+                "dynamo_graph_count": explanation.graph_count,
+                "dynamo_graph_break_count": explanation.graph_break_count,
+                "dynamo_break_reasons": [
+                    str(reason) for reason in explanation.break_reasons
+                ],
+                "dynamo_guards": [
+                    str(guard) for guard in explanation.out_guards
+                ],
+                "dynamo_ops_per_graph": [
+                    [str(operation) for operation in operations]
+                    for operations in explanation.ops_per_graph
+                ],
+                "dynamo_graph_files": dynamo_graph_files,
+            }
+            with open(
+                component_dir / "manifest.json", "w", encoding="utf-8"
+            ) as file:
+                json.dump(component_manifest, file, indent=2)
+            manifest["components"].append(component_manifest)
+
+        with open(dump_root / "manifest.json", "w", encoding="utf-8") as file:
+            json.dump(manifest, file, indent=2)
+        torch.save(rng_state(), dump_root / "rng_state_after.pt")
+        log(f"Model decomposition capture saved to {dump_root}")
 
     def run(self, input_args: dict) -> Tuple[DiffusionOutput, list]:
         """Run the model and optionally check repeated outputs for determinism.
@@ -803,7 +1274,7 @@ class xFuserModel(abc.ABC):
                 "Individual iteration timings will not be affected."
             )
 
-        if "_arech_debug_mode" in input_args:
+        if "_model_dump_requested" in input_args:
             self._dump_model(input_args)
 
         inference_start = torch.cuda.Event(enable_timing=True)

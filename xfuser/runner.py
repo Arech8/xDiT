@@ -120,20 +120,13 @@ if __name__ == "__main__":
     runner.print_args(args)
 
     DUMP_MODEL=True
-    if DUMP_MODEL:
-        from torch.utils._debug_mode import DebugMode
-        debug_mode = DebugMode(record_nn_module=True,record_stack_trace=True, record_ids=True)
-    else:
-        import contextlib
-        debug_mode = contextlib.nullcontext()
+    input_args = runner.preprocess_args(args)
+    runner.initialize(input_args)
 
-    with debug_mode:
-        input_args = runner.preprocess_args(args)
-        runner.initialize(input_args)
-
-    if DUMP_MODEL:
-        input_args["_arech_debug_mode"] = debug_mode
-    del debug_mode
+    if DUMP_MODEL and not xfuser_args.profile:
+        # Keep only a copy-safe marker in input_args. The dump implementation
+        # captures real component boundaries and builds executable FX graphs.
+        input_args["_model_dump_requested"] = True
 
     if xfuser_args.profile:
         out, timing, profile = runner.profile(input_args)
