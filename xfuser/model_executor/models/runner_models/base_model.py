@@ -1060,14 +1060,14 @@ class xFuserModel(abc.ABC):
 
         try:
             # Run the production pipeline once to obtain real rank-local
-            # component boundaries and the compiled reference output.
+            # component boundaries and the configured runtime output.
             self._run_timed_pipe(input_args)
         finally:
             for hook in hooks:
                 hook.remove()
 
         manifest = {
-            "format_version": 1,
+            "format_version": 2,
             "model": self.config.model,
             "rank": rank,
             "world_size": world.world_size,
@@ -1076,8 +1076,19 @@ class xFuserModel(abc.ABC):
             "torch_cuda_version": getattr(torch.version, "cuda", None),
             "torch_hip_version": getattr(torch.version, "hip", None),
             "diffusers_version": diffusers.__version__,
-            "compile_mode": self._get_compile_mode(),
-            "compile_dynamic": self._get_compile_dynamic(),
+            "compile_enabled": bool(self.config.use_torch_compile),
+            "compile_mode": (
+                self._get_compile_mode()
+                if self.config.use_torch_compile
+                else None
+            ),
+            "compile_dynamic": (
+                self._get_compile_dynamic()
+                if self.config.use_torch_compile
+                else None
+            ),
+            "model_compile_mode": self._get_compile_mode(),
+            "model_compile_dynamic": self._get_compile_dynamic(),
             "grad_enabled": torch.is_grad_enabled(),
             "inference_mode_enabled": torch.is_inference_mode_enabled(),
             "autocast_enabled": torch.is_autocast_enabled(),
@@ -1129,12 +1140,12 @@ class xFuserModel(abc.ABC):
 
             args = record["args"]
             kwargs = record["kwargs"]
-            compiled_output = record["output"]
+            runtime_output = record["output"]
             torch.save(
                 {
                     "args": args,
                     "kwargs": kwargs,
-                    "compiled_output": compiled_output,
+                    "runtime_output": runtime_output,
                 },
                 component_dir / "boundary.pt",
             )
@@ -1219,7 +1230,7 @@ class xFuserModel(abc.ABC):
                 "make_fx_graph_file": "make_fx_graph.pt",
                 "eager_output_file": "eager_output.pt",
                 "inputs": tensor_tree_metadata((args, kwargs)),
-                "compiled_output": tensor_tree_metadata(compiled_output),
+                "runtime_output": tensor_tree_metadata(runtime_output),
                 "eager_output": tensor_tree_metadata(eager_output),
                 "dynamo_graph_count": explanation.graph_count,
                 "dynamo_graph_break_count": explanation.graph_break_count,
