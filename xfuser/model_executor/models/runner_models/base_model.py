@@ -756,7 +756,7 @@ class xFuserModel(abc.ABC):
 
         return determinism_failures, expected_output
 
-    def _dump_model(self, input_args) -> None:
+    def _legacy_dump_model(self, input_args) -> None:
         """Capture executable eager and Dynamo FX graphs for compiled components.
 
         The full component graph is the fidelity artifact. ``nn_module_stack``
@@ -1257,6 +1257,45 @@ class xFuserModel(abc.ABC):
         torch.save(rng_state(), dump_root / "rng_state_after.pt")
         log(f"Model decomposition capture saved to {dump_root}")
 
+    # The former dump path is deliberately not exposed: it writes a conflicting
+    # format and contains rank barriers that are unsafe during partial failure.
+    del _legacy_dump_model
+
+    def _dump_model(
+        self, run_callable: Callable[[dict], tuple], input_args: dict
+    ) -> tuple:
+        """Run one complete rank-local semantic execution acquisition."""
+
+        from xfuser.model_executor.execution_capture import (
+            CapturePolicy,
+            ExecutionCaptureSession,
+        )
+
+        world = get_world_group()
+        policy = CapturePolicy.from_json(self.config.capture_execution_policy)
+        metadata = {
+            "model": self.config.model,
+            "torch_version": torch.__version__,
+            "diffusers_version": diffusers.__version__,
+            "compile_enabled": bool(self.config.use_torch_compile),
+        }
+        with ExecutionCaptureSession(
+            self.config.output_directory,
+            policy=policy,
+            rank=world.rank,
+            world_size=world.world_size,
+            metadata=metadata,
+        ) as session:
+            if self.config.use_torch_compile:
+                session.loss(
+                    "opaque_compiled_execution",
+                    "compiled internals are not dispatcher-complete; rerun without "
+                    "--use-torch-compile for semantic capture",
+                    severity="error",
+                    replayable=False,
+                )
+            return session.capture_call(run_callable, input_args)
+
     def run(self, input_args: dict) -> Tuple[DiffusionOutput, list]:
         """Run the model and optionally check repeated outputs for determinism.
 
@@ -1285,9 +1324,6 @@ class xFuserModel(abc.ABC):
                 "Individual iteration timings will not be affected."
             )
 
-        if "_model_dump_requested" in input_args:
-            self._dump_model(input_args)
-
         inference_start = torch.cuda.Event(enable_timing=True)
         inference_end = torch.cuda.Event(enable_timing=True)
         torch.cuda.synchronize()
@@ -1296,11 +1332,25 @@ class xFuserModel(abc.ABC):
         for iteration in range(self.config.num_iterations):
             log(f"Running iteration {iteration + 1}/{self.config.num_iterations}")
 
+            capture_this_iteration = (
+                iteration == 0
+                and getattr(self.config, "capture_execution", False)
+            )
+            run_callable = (
+                self._run_pipe_batched
+                if self.config.batch_size
+                else self._run_timed_pipe
+            )
+            if capture_this_iteration:
+                iteration_result = self._dump_model(run_callable, input_args)
+            else:
+                iteration_result = run_callable(input_args)
+
             if self.config.batch_size: # Run in batched mode
-                output, batch_timings = self._run_pipe_batched(input_args)
+                output, batch_timings = iteration_result
                 timings += batch_timings
             else: # Run all in one go
-                output, timing = self._run_timed_pipe(input_args)
+                output, timing = iteration_result
                 timings.append(timing)
                 log(f"Iteration {iteration + 1} completed in {timing:.2f}s")
 

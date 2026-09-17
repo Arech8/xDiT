@@ -119,14 +119,8 @@ if __name__ == "__main__":
     runner = xFuserModelRunner(args)
     runner.print_args(args)
 
-    DUMP_MODEL=True
     input_args = runner.preprocess_args(args)
     runner.initialize(input_args)
-
-    if DUMP_MODEL and not xfuser_args.profile:
-        # Keep only a copy-safe marker in input_args. The dump implementation
-        # captures real component boundaries and builds executable FX graphs.
-        input_args["_model_dump_requested"] = True
 
     if xfuser_args.profile:
         out, timing, profile = runner.profile(input_args)

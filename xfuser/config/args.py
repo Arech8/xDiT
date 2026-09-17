@@ -11,6 +11,7 @@ import torch.distributed
 
 from xfuser.logger import init_logger
 from xfuser.core.distributed import init_distributed_environment
+from xfuser.model_executor.execution_capture.policy import CapturePolicy
 from xfuser.config.config import (
     DEFAULT_FP8_COMMS_SAFETY_FACTOR,
     EngineConfig,
@@ -233,6 +234,8 @@ class xFuserArgs:
     profile_wait: int = 2
     profile_warmup: int = 2
     profile_active: int = 1
+    capture_execution: bool = False
+    capture_execution_policy: str | None = None
     warmup_calls: int = 0
     output_directory: str = "."
     input_images: Optional[List[str]] = None
@@ -278,6 +281,21 @@ class xFuserArgs:
     distilled_transformer_2_path: Optional[str] = None
 
     def __post_init__(self):
+        capture_policy = CapturePolicy.from_json(self.capture_execution_policy)
+        if self.capture_execution and self.profile:
+            raise ValueError(
+                "--capture-execution cannot be combined with --profile because both "
+                "own process-wide execution instrumentation"
+            )
+        if (
+            self.capture_execution
+            and self.use_torch_compile
+            and capture_policy.strict
+        ):
+            raise ValueError(
+                "strict --capture-execution requires eager acquisition; disable "
+                "--use-torch-compile or set {\"strict\": false} explicitly"
+            )
         self.determinism_check_report_ranks = (
             _normalize_determinism_check_report_ranks(
                 self.determinism_check_report_ranks
@@ -345,6 +363,17 @@ class xFuserArgs:
             "--use_onediff",
             action="store_true",
             help="Enable onediff to accelerate inference in a single card",
+        )
+        runtime_group.add_argument(
+            "--capture_execution",
+            action="store_true",
+            help="Capture one complete eager pipeline acquisition run.",
+        )
+        runtime_group.add_argument(
+            "--capture_execution_policy",
+            type=str,
+            default=None,
+            help="Validated JSON policy for --capture-execution.",
         )
         runtime_group.add_argument(
             "--use_teacache",
@@ -965,6 +994,18 @@ class xFuserArgs:
             default=False,
             action="store_true",
             help="Whether to run Pytorch profiler. See --profile_wait, --profile_warmup and --profile_active for profiler specific warmup."
+        )
+        parser.add_argument(
+            "--capture_execution",
+            default=False,
+            action="store_true",
+            help="Capture one complete eager pipeline acquisition run.",
+        )
+        parser.add_argument(
+            "--capture_execution_policy",
+            type=str,
+            default=None,
+            help="Validated JSON policy for --capture-execution.",
         )
         parser.add_argument(
             "--profile_wait",
