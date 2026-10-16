@@ -19,7 +19,11 @@ from xfuser.core.distributed import (
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
 )
-from xfuser.model_executor.models.transformers.transformers_utils import chunk_and_pad_sequence, gather_and_unpad
+from xfuser.model_executor.models.transformers.transformers_utils import (
+    TwoStreamSPSplit,
+    skip_empty_sequence,
+    zero_sp_pad_rows_hook,
+)
 
 from xfuser.model_executor.layers.fused_qk_rope_flydsl import (
     flydsl_fused_qk_norm_rope,
@@ -43,16 +47,27 @@ def _qwen_cos_sin(freqs: torch.Tensor):
 
 
 class xFuserQwenDoubleStreamAttnProcessor:
+    def __init__(self, attention_kwargs: Optional[Dict[str, Any]] = None) -> None:
+        # The wrapper's dict, which publishes the SP pad (`valid_kv_len`) per forward. Held here rather than passed
+        # through the block, because diffusers' Attention drops call kwargs the processor does not declare.
+        self.attention_kwargs = attention_kwargs
+
     def __call__(
         self,
         attn,
         hidden_states: torch.FloatTensor,  # Image stream
         encoder_hidden_states: torch.FloatTensor = None,  # Text stream
         encoder_hidden_states_mask: torch.FloatTensor = None,
+        # FIXME: ignored, so a batch of prompts of different lengths attends to the text padding of the shorter ones,
+        # even on one GPU. Under SP the wrapper's mask is also wrong: it joins the full text mask to this rank's image
+        # rows only, so honoring it needs the mask split like the streams (TwoStreamSPSplit).
         attention_mask: Optional[torch.FloatTensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
     ) -> torch.FloatTensor:
         seq_txt = encoder_hidden_states.shape[1]
+        # Under SP a rank may hold no text rows (TwoStreamSPSplit). Its text stream skips every op: quantized GEMMs
+        # raise on an empty input, diffusers' RoPE cannot reshape one, and an empty stream needs none of them.
+        has_txt = seq_txt > 0
 
         # Compute QKV for image stream (sample projections)
         img_query = attn.to_q(hidden_states)
@@ -60,9 +75,12 @@ class xFuserQwenDoubleStreamAttnProcessor:
         img_value = attn.to_v(hidden_states)
 
         # Compute QKV for text stream (context projections)
-        txt_query = attn.add_q_proj(encoder_hidden_states)
-        txt_key = attn.add_k_proj(encoder_hidden_states)
-        txt_value = attn.add_v_proj(encoder_hidden_states)
+        if has_txt:
+            txt_query = attn.add_q_proj(encoder_hidden_states)
+            txt_key = attn.add_k_proj(encoder_hidden_states)
+            txt_value = attn.add_v_proj(encoder_hidden_states)
+        else:
+            txt_query = txt_key = txt_value = img_query[:, :0]
 
         # Reshape for multi-head attention
         img_query = img_query.unflatten(-1, (attn.heads, -1))
@@ -83,18 +101,19 @@ class xFuserQwenDoubleStreamAttnProcessor:
             img_query, img_key = flydsl_fused_qk_norm_rope(
                 img_query, img_key, attn.norm_q, attn.norm_k, _qwen_cos_sin(img_freqs)
             )
-            txt_query, txt_key = flydsl_fused_qk_norm_rope(
-                txt_query, txt_key, attn.norm_added_q, attn.norm_added_k, _qwen_cos_sin(txt_freqs)
-            )
+            if has_txt:
+                txt_query, txt_key = flydsl_fused_qk_norm_rope(
+                    txt_query, txt_key, attn.norm_added_q, attn.norm_added_k, _qwen_cos_sin(txt_freqs)
+                )
         else:
             # Apply QK normalization
             if attn.norm_q is not None:
                 img_query = attn.norm_q(img_query)
             if attn.norm_k is not None:
                 img_key = attn.norm_k(img_key)
-            if attn.norm_added_q is not None:
+            if attn.norm_added_q is not None and has_txt:
                 txt_query = attn.norm_added_q(txt_query)
-            if attn.norm_added_k is not None:
+            if attn.norm_added_k is not None and has_txt:
                 txt_key = attn.norm_added_k(txt_key)
 
             # Apply RoPE
@@ -102,8 +121,9 @@ class xFuserQwenDoubleStreamAttnProcessor:
                 img_freqs, txt_freqs = image_rotary_emb
                 img_query = apply_rotary_emb_qwen(img_query, img_freqs, use_real=False)
                 img_key = apply_rotary_emb_qwen(img_key, img_freqs, use_real=False)
-                txt_query = apply_rotary_emb_qwen(txt_query, txt_freqs, use_real=False)
-                txt_key = apply_rotary_emb_qwen(txt_key, txt_freqs, use_real=False)
+                if has_txt:
+                    txt_query = apply_rotary_emb_qwen(txt_query, txt_freqs, use_real=False)
+                    txt_key = apply_rotary_emb_qwen(txt_key, txt_freqs, use_real=False)
 
         # Concatenate for joint attention
         # Order: [text, image]
@@ -118,6 +138,7 @@ class xFuserQwenDoubleStreamAttnProcessor:
             dropout_p=0.0,
             is_causal=False,
             attn_layer=attn,
+            attention_kwargs=self.attention_kwargs,
         ).transpose(1, 2)
 
         # Reshape back
@@ -133,7 +154,11 @@ class xFuserQwenDoubleStreamAttnProcessor:
         if len(attn.to_out) > 1:
             img_attn_output = attn.to_out[1](img_attn_output)  # dropout
 
-        txt_attn_output = attn.to_add_out(txt_attn_output.contiguous())
+        if has_txt:
+            txt_attn_output = attn.to_add_out(txt_attn_output.contiguous())
+        else:
+            # Shaped like the block's text stream, which to_add_out maps back to.
+            txt_attn_output = encoder_hidden_states
 
         return img_attn_output, txt_attn_output
 
@@ -169,9 +194,18 @@ class xFuserQwenImageTransformerWrapper(QwenImageTransformer2DModel):
             use_layer3d_rope=use_layer3d_rope,
         )
 
+        # The key is always present because torch.compile guards on the dict's key set.
+        self._self_attn_kwargs = {"valid_kv_len": None}
         for block in self.transformer_blocks:
-            block.attn.processor = xFuserQwenDoubleStreamAttnProcessor()
+            block.attn.processor = xFuserQwenDoubleStreamAttnProcessor(attention_kwargs=self._self_attn_kwargs)
         register_fp8_comms_eligible_modules(self, [block.attn for block in self.transformer_blocks])
+        # Pad rows of this rank's image chunk, set per forward; 0 leaves the blocks untouched. A block returns
+        # (text, image), and only the image stream holds pad rows.
+        self._sp_pad = {"local_rows": 0}
+        for block in self.transformer_blocks:
+            block.register_forward_hook(zero_sp_pad_rows_hook(self._sp_pad, index=1))
+            # The block's one text-stream GEMM outside the processor; see its guard there.
+            skip_empty_sequence(block.txt_mlp)
 
     def forward(
         self,
@@ -189,6 +223,9 @@ class xFuserQwenImageTransformerWrapper(QwenImageTransformer2DModel):
     ) -> Union[torch.Tensor, Transformer2DModelOutput]:
         sp_world_rank = get_sequence_parallel_rank()
         sp_world_size = get_sequence_parallel_world_size()
+        if controlnet_block_samples is not None and sp_world_size > 1:
+            # No runner drives a Qwen-Image ControlNet, so how its residuals would be split is left open.
+            raise NotImplementedError("Qwen-Image ControlNet residuals are not supported with sequence parallelism.")
 
         if attention_kwargs is not None:
             attention_kwargs = attention_kwargs.copy()
@@ -233,21 +270,26 @@ class xFuserQwenImageTransformerWrapper(QwenImageTransformer2DModel):
 
         image_rotary_emb = self.pos_embed(img_shapes, max_txt_seq_len=text_seq_len, device=hidden_states.device)
 
-        pad_amount = (sp_world_size - (hidden_states.shape[1] % sp_world_size)) % sp_world_size
-        encoder_pad_amount = (sp_world_size - (encoder_hidden_states.shape[1] % sp_world_size)) % sp_world_size
-        hidden_states = chunk_and_pad_sequence(hidden_states, sp_world_rank, sp_world_size, pad_amount, dim=1)
-        encoder_hidden_states = chunk_and_pad_sequence(
-            encoder_hidden_states, sp_world_rank, sp_world_size, encoder_pad_amount, dim=1
-        )
-
+        # The processor attends over [text, image]; TwoStreamSPSplit explains why the streams split unevenly.
+        sp_split = TwoStreamSPSplit.plan(encoder_hidden_states.shape[1], hidden_states.shape[1], sp_world_size)
+        # The pad keys get a zero logit (their RoPE rows are zero too) and would act as an attention sink; USP drops
+        # them given the real length.
+        self._self_attn_kwargs["valid_kv_len"] = sp_split.valid_kv_len
+        self._sp_pad["local_rows"] = sp_split.local_pad_rows(sp_world_rank)
+        encoder_hidden_states = sp_split.shard_first(encoder_hidden_states, sp_world_rank, dim=1)
+        hidden_states = sp_split.shard_last(hidden_states, sp_world_rank, dim=1)
         image_rotary_emb = [
-            chunk_and_pad_sequence(image_rotary_emb[0], sp_world_rank, sp_world_size, pad_amount, dim=0),
-            chunk_and_pad_sequence(image_rotary_emb[1], sp_world_rank, sp_world_size, encoder_pad_amount, dim=0),
+            sp_split.shard_last(image_rotary_emb[0], sp_world_rank, dim=0),
+            sp_split.shard_first(image_rotary_emb[1], sp_world_rank, dim=0),
         ]
+        if modulate_index is not None:
+            # Index 0 marks the edited image's rows, 1 the condition images'; a pad row may take either.
+            modulate_index = sp_split.shard_last(modulate_index, sp_world_rank, dim=1)
 
         # Construct joint attention mask once to avoid reconstructing in every block
         # This eliminates 60 GPU syncs during training while maintaining torch.compile compatibility
         block_attention_kwargs = attention_kwargs.copy() if attention_kwargs is not None else {}
+        # FIXME: the processor ignores this mask; see the FIXME on its `attention_mask` parameter.
         if encoder_hidden_states_mask is not None:
             # Build joint mask: [text_mask, all_ones_for_image]
             batch_size, image_seq_len = hidden_states.shape[:2]
@@ -291,7 +333,7 @@ class xFuserQwenImageTransformerWrapper(QwenImageTransformer2DModel):
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
 
-        output = gather_and_unpad(output, pad_amount, dim=1)
+        output = sp_split.gather_last(output, sp_world_rank, dim=1)
 
         if USE_PEFT_BACKEND:
             # remove `lora_scale` from each PEFT layer
